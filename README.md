@@ -80,7 +80,7 @@ The goal of Nakadi (**ნაკადი** means *stream* in Georgian) is to pro
     * Timelines:
         * this allows transparently switch production and consumption to different cluster (tier, region, AZ) without
         moving actual data and any service degradation.
-        * opens the possibility for implementation of other streaming technologies and engines besides Kafka
+        * opens the possibility for implementation of other streaming - technologies and engines besides Kafka
         (like Amazon Kinesis or Google Cloud Pub/Sub)
 
 Read more about latest development on the [releases page](https://github.com/zalando/nakadi/releases).

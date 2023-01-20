@@ -1,6 +1,5 @@
 package org.zalando.nakadi.repository.kafka;
 
-import com.codahale.metrics.MetricRegistry;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.PartitionInfo;
@@ -16,7 +15,6 @@ import org.zalando.nakadi.domain.CleanupPolicy;
 import org.zalando.nakadi.domain.EventOwnerHeader;
 import org.zalando.nakadi.domain.EventPublishingStatus;
 import org.zalando.nakadi.repository.NakadiTopicConfig;
-import org.zalando.nakadi.repository.zookeeper.ZookeeperSettings;
 import org.zalando.nakadi.util.UUIDGenerator;
 import org.zalando.nakadi.utils.TestUtils;
 import org.zalando.nakadi.webservice.BaseAT;
@@ -34,6 +32,7 @@ import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.hasSize;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.zalando.nakadi.repository.kafka.KafkaTestHelper.createKafkaProperties;
 
 public class KafkaRepositoryAT extends BaseAT {
@@ -54,12 +53,16 @@ public class KafkaRepositoryAT extends BaseAT {
     private static final Long DEFAULT_RETENTION_TIME = 100L;
     private static final Long DEFAULT_TOPIC_RETENTION = 100000000L;
     private static final CleanupPolicy DEFAULT_CLEANUP_POLICY = CleanupPolicy.DELETE;
+    private static final int KAFKA_RETRIES = 10;
     private static final int KAFKA_REQUEST_TIMEOUT = 30000;
     private static final int KAFKA_DELIVERY_TIMEOUT = 30000;
     private static final int KAFKA_MAX_BLOCK_TIMEOUT = 5000;
+    private static final int KAFKA_METADATA_MAX_AGE_MS = 1000;
+    private static final String KAFKA_COMPRESSION_TYPE = "lz4";
     private static final int KAFKA_BATCH_SIZE = 1048576;
     private static final long KAFKA_BUFFER_MEMORY = KAFKA_BATCH_SIZE * 10L;
     private static final int KAFKA_LINGER_MS = 0;
+    private static final int KAFKA_MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION = 5;
     private static final long NAKADI_EVENT_MAX_BYTES = 1000000L;
     private static final long TIMELINE_WAIT_TIMEOUT = 40000;
     private static final int NAKADI_SUBSCRIPTION_MAX_PARTITIONS = 8;
@@ -76,7 +79,6 @@ public class KafkaRepositoryAT extends BaseAT {
 
     private NakadiSettings nakadiSettings;
     private KafkaSettings kafkaSettings;
-    private ZookeeperSettings zookeeperSettings;
     private KafkaTestHelper kafkaHelper;
     private KafkaTopicRepository kafkaTopicRepository;
     private NakadiTopicConfig defaultTopicConfig;
@@ -105,10 +107,10 @@ public class KafkaRepositoryAT extends BaseAT {
                 DEFAULT_CURATOR_MAX_LIFETIME_MS,
                 DEFAULT_CURATOR_ROTATION_MS);
 
-        kafkaSettings = new KafkaSettings(KAFKA_REQUEST_TIMEOUT, KAFKA_BATCH_SIZE, KAFKA_BUFFER_MEMORY,
-                KAFKA_LINGER_MS, KAFKA_ENABLE_AUTO_COMMIT, KAFKA_MAX_REQUEST_SIZE,
-                KAFKA_DELIVERY_TIMEOUT, KAFKA_MAX_BLOCK_TIMEOUT, "");
-        zookeeperSettings = new ZookeeperSettings(ZK_SESSION_TIMEOUT, ZK_CONNECTION_TIMEOUT, ZK_MAX_IN_FLIGHT_REQUESTS);
+        kafkaSettings = new KafkaSettings(KAFKA_RETRIES, KAFKA_REQUEST_TIMEOUT, KAFKA_BATCH_SIZE, KAFKA_BUFFER_MEMORY,
+                KAFKA_LINGER_MS, KAFKA_MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, KAFKA_ENABLE_AUTO_COMMIT,
+                KAFKA_MAX_REQUEST_SIZE, KAFKA_DELIVERY_TIMEOUT, KAFKA_MAX_BLOCK_TIMEOUT, "", KAFKA_COMPRESSION_TYPE,
+                KAFKA_METADATA_MAX_AGE_MS);
         kafkaHelper = new KafkaTestHelper(KAFKA_URL);
         defaultTopicConfig = new NakadiTopicConfig(DEFAULT_PARTITION_COUNT, DEFAULT_CLEANUP_POLICY,
                 Optional.of(DEFAULT_RETENTION_TIME));
@@ -260,7 +262,7 @@ public class KafkaRepositoryAT extends BaseAT {
     }
 
     private Map<String, List<PartitionInfo>> getAllTopics() {
-        final KafkaConsumer<String, String> kafkaConsumer = kafkaHelper.createConsumer();
+        final KafkaConsumer<byte[], byte[]> kafkaConsumer = kafkaHelper.createConsumer();
         return kafkaConsumer.listTopics();
     }
 
@@ -281,17 +283,19 @@ public class KafkaRepositoryAT extends BaseAT {
         Mockito
                 .doReturn(kafkaHelper.createProducer())
                 .when(factory)
-                .takeProducer();
+                .takeDefaultProducer();
+        Mockito
+                .doReturn(kafkaHelper.createProducer())
+                .when(factory)
+                .takeProducer(anyString());
 
         return new KafkaTopicRepository.Builder()
                 .setKafkaZookeeper(kafkaZookeeper)
                 .setKafkaFactory(factory)
                 .setNakadiSettings(nakadiSettings)
                 .setKafkaSettings(kafkaSettings)
-                .setZookeeperSettings(zookeeperSettings)
                 .setKafkaTopicConfigFactory(kafkaTopicConfigFactory)
                 .setKafkaLocationManager(kafkaLocationManager)
-                .setMetricRegistry(new MetricRegistry())
                 .build();
     }
 

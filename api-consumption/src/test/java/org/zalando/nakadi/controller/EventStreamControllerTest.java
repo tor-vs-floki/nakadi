@@ -36,7 +36,6 @@ import org.zalando.nakadi.security.FullAccessClient;
 import org.zalando.nakadi.security.NakadiClient;
 import org.zalando.nakadi.service.AdminService;
 import org.zalando.nakadi.service.AuthorizationValidator;
-import org.zalando.nakadi.service.ClosedConnectionsCrutch;
 import org.zalando.nakadi.service.EventStream;
 import org.zalando.nakadi.service.EventStreamChecks;
 import org.zalando.nakadi.service.EventStreamConfig;
@@ -54,14 +53,12 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetAddress;
-import java.net.UnknownHostException;
 import java.util.Collections;
 import java.util.Date;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 import static org.hamcrest.CoreMatchers.equalTo;
@@ -124,7 +121,7 @@ public class EventStreamControllerTest {
     private AuthorizationService authorizationService;
 
     @Before
-    public void setup() throws UnknownHostException, InvalidCursorException {
+    public void setup() throws InvalidCursorException {
         EVENT_TYPE.setName(TEST_EVENT_TYPE_NAME);
         timeline = buildTimeline(TEST_EVENT_TYPE_NAME, TEST_TOPIC, new Date());
 
@@ -143,12 +140,8 @@ public class EventStreamControllerTest {
         metricRegistry = new MetricRegistry();
         streamMetrics = new MetricRegistry();
         final EventConsumer.LowLevelConsumer eventConsumerMock = mock(EventConsumer.LowLevelConsumer.class);
-        when(topicRepositoryMock.createEventConsumer(
-                eq(KAFKA_CLIENT_ID), any()))
+        when(topicRepositoryMock.createEventConsumer(eq(KAFKA_CLIENT_ID), any()))
                 .thenReturn(eventConsumerMock);
-
-        final ClosedConnectionsCrutch crutch = mock(ClosedConnectionsCrutch.class);
-        when(crutch.listenForConnectionClose(requestMock)).thenReturn(new AtomicBoolean(true));
 
         eventStreamChecks = Mockito.mock(EventStreamChecks.class);
         Mockito.when(eventStreamChecks.isConsumptionBlocked(any(), any())).thenReturn(false);
@@ -165,13 +158,12 @@ public class EventStreamControllerTest {
         when(eventTypeChangeListener.registerListener(any(), any())).thenReturn(mock(Closeable.class));
         controller = new EventStreamController(
                 eventTypeCache, timelineService, OBJECT_MAPPER, eventStreamFactoryMock, metricRegistry,
-                streamMetrics, crutch, eventStreamChecks,
+                streamMetrics, eventStreamChecks,
                 new CursorConverterImpl(eventTypeCache, timelineService), authorizationValidator,
                 eventTypeChangeListener, null);
 
         settings = mock(SecuritySettings.class);
         when(settings.getAuthMode()).thenReturn(OFF);
-        when(settings.getAdminClientId()).thenReturn("org/zalando/nakadi");
 
         mockMvc = standaloneSetup(controller)
                 .setMessageConverters(new StringHttpMessageConverter(), JACKSON_2_HTTP_MESSAGE_CONVERTER)
@@ -198,8 +190,7 @@ public class EventStreamControllerTest {
         final ArgumentCaptor<EventStreamConfig> configCaptor = ArgumentCaptor.forClass(EventStreamConfig.class);
 
         final EventConsumer.LowLevelConsumer eventConsumerMock = mock(EventConsumer.LowLevelConsumer.class);
-        when(topicRepositoryMock.createEventConsumer(
-                any(), any()))
+        when(topicRepositoryMock.createEventConsumer(any(), any()))
                 .thenReturn(eventConsumerMock);
 
         final EventStream eventStreamMock = mock(EventStream.class);
@@ -208,8 +199,7 @@ public class EventStreamControllerTest {
 
         when(eventTypeCache.getEventType(TEST_EVENT_TYPE_NAME)).thenReturn(EVENT_TYPE);
 
-        mockMvc.perform(
-                get(String.format("/event-types/%s/events", TEST_EVENT_TYPE_NAME))
+        mockMvc.perform(get(String.format("/event-types/%s/events", TEST_EVENT_TYPE_NAME))
                         .header("X-nakadi-cursors", "[{\"partition\":\"0\",\"offset\":\"000000000000000000\"}]"))
                 .andExpect(status().isOk());
 
@@ -368,7 +358,7 @@ public class EventStreamControllerTest {
                 eq(ImmutableList.of(NakadiCursor.of(timeline, "0", "000000000000000000"))));
         verify(eventStreamFactoryMock, times(1)).createEventStream(eq(outputStream),
                 eq(eventConsumerMock), eq(streamConfig), any());
-        verify(eventStreamMock, times(1)).streamEvents(any(), any());
+        verify(eventStreamMock, times(1)).streamEvents(any());
         verify(outputStream, times(2)).flush();
         verify(outputStream, times(1)).close();
     }
@@ -405,7 +395,7 @@ public class EventStreamControllerTest {
                 ThreadUtils.sleep(100);
             }
             return null;
-        }).when(eventStream).streamEvents(any(), any());
+        }).when(eventStream).streamEvents(any());
         when(eventStreamFactoryMock.createEventStream(any(), any(), any(), any())).thenReturn(eventStream);
 
         // "connect" to the server
@@ -524,19 +514,19 @@ public class EventStreamControllerTest {
     }
 
     protected StreamingResponseBody createStreamingResponseBody() throws IOException {
-        return controller.streamEvents(TEST_EVENT_TYPE_NAME, 1, 0, 0, 0, 0, null, requestMock, responseMock,
+        return controller.streamEvents(TEST_EVENT_TYPE_NAME, 1, 0, 0, 0, 0, null, responseMock,
                 FULL_ACCESS_CLIENT);
     }
 
     private StreamingResponseBody createStreamingResponseBody(final Client client) throws Exception {
         return controller.streamEvents(
                 TEST_EVENT_TYPE_NAME, 1, 2, 3, 4, 5, "[{\"partition\":\"0\",\"offset\":\"000000000000000000\"}]",
-                requestMock, responseMock, client);
+                responseMock, client);
     }
 
     private StreamingResponseBody createStreamingResponseBody(final String cursorsStr) throws Exception {
         return controller.streamEvents(TEST_EVENT_TYPE_NAME, 1, 2, 3, 4, 5, cursorsStr,
-                requestMock, responseMock, FULL_ACCESS_CLIENT);
+                responseMock, FULL_ACCESS_CLIENT);
     }
 
     private StreamingResponseBody createStreamingResponseBody(final Integer batchLimit,
@@ -544,9 +534,9 @@ public class EventStreamControllerTest {
                                                               final Integer batchTimeout,
                                                               final Integer streamTimeout,
                                                               final Integer streamKeepAliveLimit,
-                                                              final String cursorsStr) throws IOException {
+                                                              final String cursorsStr) {
         return controller.streamEvents(TEST_EVENT_TYPE_NAME, batchLimit, streamLimit, batchTimeout, streamTimeout,
-                streamKeepAliveLimit, cursorsStr, requestMock, responseMock, FULL_ACCESS_CLIENT);
+                streamKeepAliveLimit, cursorsStr, responseMock, FULL_ACCESS_CLIENT);
     }
 
 }

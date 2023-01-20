@@ -67,6 +67,7 @@ public class BatchItem implements Resource<BatchItem> {
     private String partition;
     private String brokerId;
     private String eventKey;
+    private List<String> partitionKeys;
     private int eventSize;
     private EventOwnerHeader owner;
 
@@ -138,8 +139,26 @@ public class BatchItem implements Resource<BatchItem> {
         return eventKey;
     }
 
+    @Nullable
+    public byte[] getEventKeyBytes() {
+        if (eventKey == null) {
+            return null;
+        }
+
+        return eventKey.getBytes(StandardCharsets.UTF_8);
+    }
+
     public void setEventKey(@Nullable final String key) {
         this.eventKey = key;
+    }
+
+    @Nullable
+    public List<String> getPartitionKeys() {
+        return partitionKeys;
+    }
+
+    public void setPartitionKeys(@Nullable final List<String> keys) {
+        this.partitionKeys = keys;
     }
 
     @Override
@@ -243,6 +262,10 @@ public class BatchItem implements Resource<BatchItem> {
             appendWithSkip(sb, lastMainEventUsedPosition, rawEvent.length(), currentSkipPosition);
         }
         return sb.toString();
+    }
+
+    public byte[] dumpEventToBytes() {
+        return dumpEventToString().getBytes(StandardCharsets.UTF_8);
     }
 
     private int appendWithSkip(final StringBuilder sb, final int from, final int to, final int currentSkipPosition) {

@@ -2,7 +2,6 @@ package org.zalando.nakadi.domain;
 
 public enum Feature {
 
-    CONNECTION_CLOSE_CRUTCH("close_crutch"),
     DISABLE_EVENT_TYPE_CREATION("disable_event_type_creation"),
     DISABLE_EVENT_TYPE_DELETION("disable_event_type_deletion"),
     DELETE_EVENT_TYPE_WITH_SUBSCRIPTIONS("delete_event_type_with_subscriptions"),
@@ -20,8 +19,7 @@ public enum Feature {
     TOKEN_SUBSCRIPTIONS_ITERATION("token_subscription_iteration"),
     RETURN_BODY_ON_CREATE_UPDATE_EVENT_TYPE("return_body_on_create_update_event_type"),
     VALIDATE_SUBSCRIPTION_OWNING_APPLICATION("validate_subscription_owning_app"),
-    VALIDATE_EVENT_TYPE_OWNING_APPLICATION("validate_event_type_owning_app"),
-    ;
+    VALIDATE_EVENT_TYPE_OWNING_APPLICATION("validate_event_type_owning_app");
 
     private final String id;
 

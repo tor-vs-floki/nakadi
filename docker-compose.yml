@@ -2,7 +2,10 @@ version: '3'
 services:
 
   nakadi:
-    build: .
+    build:
+      context: .
+      args:
+        BASE_IMAGE: "registry.opensource.zalan.do/library/openjdk-11-jre-slim:latest"
     ports:
     - "8080:8080"
     depends_on:
@@ -12,7 +15,6 @@ services:
     environment:
     - SPRING_PROFILES_ACTIVE
     - NAKADI_OAUTH2_MODE=OFF
-    - NAKADI_FEATURES_DEFAULT_FEATURES_CONNECTION_CLOSE_CRUTCH
     - NAKADI_FEATURES_DEFAULT_FEATURES_DISABLE_EVENT_TYPE_CREATION
     - NAKADI_FEATURES_DEFAULT_FEATURES_DISABLE_EVENT_TYPE_DELETION
     - NAKADI_FEATURES_DEFAULT_FEATURES_DISABLE_SUBSCRIPTION_CREATION
@@ -41,7 +43,7 @@ services:
     - "2181:2181"
 
   kafka:
-    image: registry.opensource.zalan.do/aruha/nakadi-kafka:2.7.1
+    image: bitnami/kafka:3.1.1
     ports:
     - "29092:29092"
     - "9092:9092"
@@ -56,5 +58,6 @@ services:
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
       KAFKA_DELETE_TOPIC_ENABLE: 'true'
       KAFKA_BROKER_ID: 0
+      ALLOW_PLAINTEXT_LISTENER: 'yes'
     volumes:
     - /var/run/docker.sock:/var/run/docker.sock

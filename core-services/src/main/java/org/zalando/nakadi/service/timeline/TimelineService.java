@@ -5,12 +5,11 @@ import com.google.common.collect.Multimap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.TransactionException;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.zalando.nakadi.cache.EventTypeCache;
 import org.zalando.nakadi.config.NakadiSettings;
 import org.zalando.nakadi.domain.CleanupPolicy;
 import org.zalando.nakadi.domain.EventType;
@@ -20,7 +19,6 @@ import org.zalando.nakadi.domain.NakadiCursor;
 import org.zalando.nakadi.domain.PartitionStatistics;
 import org.zalando.nakadi.domain.ResourceImpl;
 import org.zalando.nakadi.domain.Timeline;
-import org.zalando.nakadi.domain.storage.DefaultStorage;
 import org.zalando.nakadi.domain.storage.Storage;
 import org.zalando.nakadi.exceptions.runtime.AccessDeniedException;
 import org.zalando.nakadi.exceptions.runtime.ConflictException;
@@ -41,18 +39,19 @@ import org.zalando.nakadi.exceptions.runtime.TopicCreationException;
 import org.zalando.nakadi.exceptions.runtime.TopicDeletionException;
 import org.zalando.nakadi.exceptions.runtime.TopicRepositoryException;
 import org.zalando.nakadi.exceptions.runtime.UnableProcessException;
+import org.zalando.nakadi.mapper.NakadiRecordMapper;
 import org.zalando.nakadi.plugin.api.authz.AuthorizationService;
 import org.zalando.nakadi.repository.EventConsumer;
 import org.zalando.nakadi.repository.NakadiTopicConfig;
 import org.zalando.nakadi.repository.TopicRepository;
 import org.zalando.nakadi.repository.TopicRepositoryHolder;
-import org.zalando.nakadi.cache.EventTypeCache;
 import org.zalando.nakadi.repository.db.StorageDbRepository;
 import org.zalando.nakadi.repository.db.TimelineDbRepository;
 import org.zalando.nakadi.service.AdminService;
 import org.zalando.nakadi.service.FeatureToggleService;
-import org.zalando.nakadi.service.publishing.NakadiAuditLogPublisher;
+import org.zalando.nakadi.service.LocalSchemaRegistry;
 import org.zalando.nakadi.service.NakadiCursorComparator;
+import org.zalando.nakadi.service.SchemaProviderService;
 import org.zalando.nakadi.service.StaticStorageWorkerFactory;
 
 import javax.annotation.Nullable;
@@ -75,11 +74,13 @@ public class TimelineService {
     private final TimelineDbRepository timelineDbRepository;
     private final TopicRepositoryHolder topicRepositoryHolder;
     private final TransactionTemplate transactionTemplate;
-    private final DefaultStorage defaultStorage;
     private final AdminService adminService;
     private final FeatureToggleService featureToggleService;
     private final String compactedStorageName;
-    private final NakadiAuditLogPublisher auditLogPublisher;
+    // one man said, it is fine to add 11th argument
+    private final SchemaProviderService schemaService;
+    private final LocalSchemaRegistry localSchemaRegistry;
+    private final NakadiRecordMapper nakadiRecordMapper;
 
     @Autowired
     public TimelineService(final EventTypeCache eventTypeCache,
@@ -89,11 +90,12 @@ public class TimelineService {
                            final TimelineDbRepository timelineDbRepository,
                            final TopicRepositoryHolder topicRepositoryHolder,
                            final TransactionTemplate transactionTemplate,
-                           @Qualifier("default_storage") final DefaultStorage defaultStorage,
                            final AdminService adminService,
                            final FeatureToggleService featureToggleService,
                            @Value("${nakadi.timelines.storage.compacted}") final String compactedStorageName,
-                           @Lazy final NakadiAuditLogPublisher auditLogPublisher) {
+                           final SchemaProviderService schemaService,
+                           final LocalSchemaRegistry localSchemaRegistry,
+                           final NakadiRecordMapper nakadiRecordMapper) {
         this.eventTypeCache = eventTypeCache;
         this.storageDbRepository = storageDbRepository;
         this.timelineSync = timelineSync;
@@ -101,14 +103,15 @@ public class TimelineService {
         this.timelineDbRepository = timelineDbRepository;
         this.topicRepositoryHolder = topicRepositoryHolder;
         this.transactionTemplate = transactionTemplate;
-        this.defaultStorage = defaultStorage;
         this.adminService = adminService;
         this.featureToggleService = featureToggleService;
         this.compactedStorageName = compactedStorageName;
-        this.auditLogPublisher = auditLogPublisher;
+        this.schemaService = schemaService;
+        this.localSchemaRegistry = localSchemaRegistry;
+        this.nakadiRecordMapper = nakadiRecordMapper;
     }
 
-    public void createTimeline(final String eventTypeName, final String storageId)
+    public Timeline createTimeline(final String eventTypeName, final String storageId)
             throws AccessDeniedException, TimelineException, TopicRepositoryException, InconsistentStateException,
             RepositoryProblemException, DbWriteOperationsBlockedException {
         if (featureToggleService.isFeatureEnabled(Feature.DISABLE_DB_WRITE_OPERATIONS)) {
@@ -143,12 +146,7 @@ public class TimelineService {
 
             switchTimelines(activeTimeline, nextTimeline);
 
-            auditLogPublisher.publish(
-                    Optional.empty(),
-                    Optional.of(nextTimeline),
-                    NakadiAuditLogPublisher.ResourceType.TIMELINE,
-                    NakadiAuditLogPublisher.ActionType.CREATED,
-                    String.valueOf(nextTimeline.getId()));
+            return nextTimeline;
         } catch (final TopicCreationException | TopicConfigException | ServiceTemporarilyUnavailableException |
                 InternalNakadiException e) {
             throw new TimelineException("Internal service error", e);
@@ -160,7 +158,7 @@ public class TimelineService {
     public void updateTimeLineForRepartition(final EventType eventType, final int partitions)
             throws NakadiBaseException {
         for (final Timeline timeline : getActiveTimelinesOrdered(eventType.getName())) {
-            getTopicRepository(eventType).repartition(timeline.getTopic(), partitions);
+            getTopicRepository(timeline.getStorage()).repartition(timeline.getTopic(), partitions);
         }
 
         for (final Timeline timeline : getActiveTimelinesOrdered(eventType.getName())) {
@@ -188,7 +186,9 @@ public class TimelineService {
                     "are blocked by feature flag.");
         }
 
-        Storage storage = defaultStorage.getStorage();
+        Storage storage = storageDbRepository.getDefaultStorage()
+                .orElseThrow(() -> new TopicCreationException("Default storage is not set"));
+
         final Optional<Long> retentionTime = Optional.ofNullable(eventType.getOptions().getRetentionTime());
         if (eventType.getCleanupPolicy() == CleanupPolicy.COMPACT ||
                 eventType.getCleanupPolicy() == CleanupPolicy.COMPACT_AND_DELETE) {
@@ -251,20 +251,25 @@ public class TimelineService {
 
     public Timeline getActiveTimeline(final String eventTypeName) throws TimelineException {
         try {
-            final List<Timeline> timelines = eventTypeCache.getTimelinesOrdered(eventTypeName);
-            final ListIterator<Timeline> rIterator = timelines.listIterator(timelines.size());
-            while (rIterator.hasPrevious()) {
-                final Timeline toCheck = rIterator.previous();
-                if (toCheck.getSwitchedAt() != null) {
-                    return toCheck;
-                }
-            }
-
-            throw new TimelineException(String.format("No timelines for event type %s", eventTypeName));
+            final Optional<Timeline> timeline = getActiveTimeline(eventTypeCache.getTimelinesOrdered(eventTypeName));
+            return timeline.orElseThrow(() -> {
+                        throw new TimelineException(String.format("No timelines for event type %s", eventTypeName));
+                    });
         } catch (final InternalNakadiException e) {
             LOG.error("Failed to get timeline for event type {}", eventTypeName, e);
             throw new TimelineException("Failed to get timeline", e);
         }
+    }
+
+    public static Optional<Timeline> getActiveTimeline(final List<Timeline> timelines) {
+        final ListIterator<Timeline> rIterator = timelines.listIterator(timelines.size());
+        while (rIterator.hasPrevious()) {
+            final Timeline toCheck = rIterator.previous();
+            if (toCheck.getSwitchedAt() != null) {
+                return Optional.of(toCheck);
+            }
+        }
+        return Optional.empty();
     }
 
     public Timeline getActiveTimeline(final EventTypeBase eventType) throws TimelineException {

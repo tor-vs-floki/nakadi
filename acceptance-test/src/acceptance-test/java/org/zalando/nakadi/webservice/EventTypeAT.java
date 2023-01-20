@@ -31,6 +31,7 @@ import org.zalando.nakadi.webservice.utils.NakadiTestUtils;
 import org.zalando.problem.Problem;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -90,7 +91,10 @@ public class EventTypeAT extends BaseAT {
         final EventType eventType = buildDefaultEventType();
         final ResourceAuthorizationAttribute auth = new ResourceAuthorizationAttribute(
                 "service", "stups_test" + randomTextString());
+        final String owningApp = "stups_owning_app";
+
         eventType.setAuthorization(new ResourceAuthorization(List.of(auth), List.of(auth), List.of(auth)));
+        eventType.setOwningApplication(owningApp);
 
         final String body = MAPPER.writer().writeValueAsString(eventType);
 
@@ -105,7 +109,8 @@ public class EventTypeAT extends BaseAT {
         given()
                 .header("accept", "application/json")
                 .contentType(JSON)
-                .get(ENDPOINT + "?writer=" + AuthorizationAttributeQueryParser.getQuery(auth))
+                .get(ENDPOINT + "?writer=" + AuthorizationAttributeQueryParser.getQuery(auth) +
+                        "&owning_application=" + owningApp)
                 .then()
                 .statusCode(HttpStatus.SC_OK)
                 .body("name", hasItems(eventType.getName()));
@@ -171,6 +176,18 @@ public class EventTypeAT extends BaseAT {
                         .getBody().asString(),
                 EventType.class);
         Assert.assertEquals(eventType.getEventOwnerSelector(), retrievedEventType.getEventOwnerSelector());
+    }
+
+    @Test
+    public void whenEventAuthSelectorCreateWithMetadataAndValueThen422() throws Exception {
+        final EventType eventType = buildDefaultEventType();
+        eventType.setEventOwnerSelector(new EventOwnerSelector(EventOwnerSelector.Type.METADATA, "x", "y"));
+
+        given().body(MAPPER.writer().writeValueAsString(eventType))
+                .header("accept", "application/json")
+                .contentType(JSON).post(ENDPOINT)
+                .then()
+                .statusCode(HttpStatus.SC_UNPROCESSABLE_ENTITY);
     }
 
     @Test
@@ -418,13 +435,13 @@ public class EventTypeAT extends BaseAT {
 
         // assert that key was correctly propagated to event key in kafka
         final KafkaTestHelper kafkaHelper = new KafkaTestHelper(KAFKA_URL);
-        final KafkaConsumer<String, String> consumer = kafkaHelper.createConsumer();
+        final KafkaConsumer<byte[], byte[]> consumer = kafkaHelper.createConsumer();
         final TopicPartition tp = new TopicPartition(topic, 0);
         consumer.assign(ImmutableList.of(tp));
         consumer.seek(tp, 0);
-        final ConsumerRecords<String, String> records = consumer.poll(5000);
-        final ConsumerRecord<String, String> record = records.iterator().next();
-        assertThat(record.key(), equalTo("abc"));
+        final ConsumerRecords<byte[], byte[]> records = consumer.poll(5000);
+        final ConsumerRecord<byte[], byte[]> record = records.iterator().next();
+        assertThat(record.key(), equalTo("abc".getBytes(StandardCharsets.UTF_8)));
 
         // publish event with missing compaction key and expect 422
         given().body("[{\"metadata\":{" +

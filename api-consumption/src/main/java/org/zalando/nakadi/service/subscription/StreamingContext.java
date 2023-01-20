@@ -12,13 +12,13 @@ import org.zalando.nakadi.exceptions.runtime.AccessDeniedException;
 import org.zalando.nakadi.exceptions.runtime.NakadiRuntimeException;
 import org.zalando.nakadi.exceptions.runtime.RebalanceConflictException;
 import org.zalando.nakadi.service.AuthorizationValidator;
+import org.zalando.nakadi.service.ConsumptionKpiCollector;
 import org.zalando.nakadi.service.CursorConverter;
 import org.zalando.nakadi.service.CursorOperationsService;
 import org.zalando.nakadi.service.CursorTokenService;
 import org.zalando.nakadi.service.EventStreamChecks;
 import org.zalando.nakadi.service.EventStreamWriter;
 import org.zalando.nakadi.service.EventTypeChangeListener;
-import org.zalando.nakadi.service.publishing.NakadiKpiPublisher;
 import org.zalando.nakadi.service.subscription.autocommit.AutocommitSupport;
 import org.zalando.nakadi.service.subscription.model.Partition;
 import org.zalando.nakadi.service.subscription.model.Session;
@@ -39,7 +39,6 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiFunction;
 
 public class StreamingContext implements SubscriptionStreamer {
@@ -51,7 +50,6 @@ public class StreamingContext implements SubscriptionStreamer {
     private final ZkSubscriptionClient zkClient;
     private final SubscriptionOutput out;
     private final long kafkaPollTimeout;
-    private final AtomicBoolean connectionReady;
     private final TimelineService timelineService;
     private final CursorTokenService cursorTokenService;
     private final ObjectMapper objectMapper;
@@ -66,14 +64,11 @@ public class StreamingContext implements SubscriptionStreamer {
     private final AuthorizationValidator authorizationValidator;
     private final EventTypeChangeListener eventTypeChangeListener;
     private final Comparator<NakadiCursor> cursorComparator;
-    private final NakadiKpiPublisher kpiPublisher;
     private final AutocommitSupport autocommitSupport;
-    private final String kpiDataStreamedEventType;
     private final CursorOperationsService cursorOperationsService;
 
-    private final long kpiCollectionFrequencyMs;
-
     private final long streamMemoryLimitBytes;
+    private final ConsumptionKpiCollector kpiCollector;
 
     private State currentState = new DummyState();
     private ZkSubscription<List<String>> sessionListSubscription;
@@ -81,7 +76,7 @@ public class StreamingContext implements SubscriptionStreamer {
     private boolean sessionRegistered;
     private boolean zkClientClosed;
 
-    private final Logger log;
+    private static final Logger LOG = LoggerFactory.getLogger(StreamingContext.class);
 
     private StreamingContext(final Builder builder) {
         this.out = builder.out;
@@ -91,8 +86,6 @@ public class StreamingContext implements SubscriptionStreamer {
         this.timer = builder.timer;
         this.zkClient = builder.zkClient;
         this.kafkaPollTimeout = builder.kafkaPollTimeout;
-        this.log = LoggerFactory.getLogger(LogPathBuilder.build(builder.subscription.getId(), builder.session.getId()));
-        this.connectionReady = builder.connectionReady;
         this.timelineService = builder.timelineService;
         this.cursorTokenService = builder.cursorTokenService;
         this.objectMapper = builder.objectMapper;
@@ -104,12 +97,14 @@ public class StreamingContext implements SubscriptionStreamer {
         this.authorizationValidator = builder.authorizationValidator;
         this.eventTypeChangeListener = builder.eventTypeChangeListener;
         this.cursorComparator = builder.cursorComparator;
-        this.kpiPublisher = builder.kpiPublisher;
         this.autocommitSupport = new AutocommitSupport(builder.cursorOperationsService, zkClient, cursorConverter);
-        this.kpiDataStreamedEventType = builder.kpiDataStremedEventType;
-        this.kpiCollectionFrequencyMs = builder.kpiCollectionFrequencyMs;
         this.streamMemoryLimitBytes = builder.streamMemoryLimitBytes;
         this.cursorOperationsService = builder.cursorOperationsService;
+        this.kpiCollector = builder.kpiCollector;
+    }
+
+    public ConsumptionKpiCollector getKpiCollector() {
+        return kpiCollector;
     }
 
     public TimelineService getTimelineService() {
@@ -152,18 +147,6 @@ public class StreamingContext implements SubscriptionStreamer {
         return this.writer;
     }
 
-    public NakadiKpiPublisher getKpiPublisher() {
-        return kpiPublisher;
-    }
-
-    public String getKpiDataStreamedEventType() {
-        return kpiDataStreamedEventType;
-    }
-
-    public long getKpiCollectionFrequencyMs() {
-        return kpiCollectionFrequencyMs;
-    }
-
     public CursorOperationsService getCursorOperationsService() {
         return cursorOperationsService;
     }
@@ -173,7 +156,8 @@ public class StreamingContext implements SubscriptionStreamer {
     }
 
     public void terminateStream() {
-        log.info("Shutdown hook called. Trying to terminate subscription gracefully");
+        LOG.info("Shutdown hook called for {} {}. Trying to terminate subscription gracefully",
+                subscription.getId(), session.getId());
         switchState(new CleanupState(null));
     }
 
@@ -195,10 +179,10 @@ public class StreamingContext implements SubscriptionStreamer {
                     task.run();
                 }
             } catch (final NakadiRuntimeException ex) {
-                log.error("Failed to process task " + task + ", will rethrow original error", ex);
+                LOG.warn("Failed to process task " + task + ", will rethrow original error");
                 switchStateImmediately(new CleanupState(ex.getException()));
             } catch (final RuntimeException ex) {
-                log.error("Failed to process task " + task + ", code carefully!", ex);
+                LOG.warn("Failed to process task " + task + ", code carefully!");
                 switchStateImmediately(new CleanupState(ex));
             }
         }
@@ -206,7 +190,7 @@ public class StreamingContext implements SubscriptionStreamer {
 
     public void switchState(final State newState) {
         this.addTask(() -> {
-            log.info("Switching state from {} to {}",
+            LOG.info("Switching state from {} to {}",
                     currentState.getClass().getSimpleName(),
                     newState.getClass().getSimpleName());
             // There is a problem with onExit call - it can not throw exceptions, otherwise it won't be possible
@@ -217,7 +201,7 @@ public class StreamingContext implements SubscriptionStreamer {
     }
 
     public void switchStateImmediately(final State newState) {
-        log.info("Cleaning task queue & Switching state immediately from {} to {}",
+        LOG.info("Cleaning task queue & Switching state immediately from {} to {}",
                 currentState.getClass().getSimpleName(),
                 newState.getClass().getSimpleName());
         taskQueue.clear();
@@ -235,7 +219,7 @@ public class StreamingContext implements SubscriptionStreamer {
     }
 
     public void registerSession() throws NakadiRuntimeException {
-        log.info("Registering session {}", session);
+        LOG.info("Registering session {}", session);
 
         // Set the flag early to make sure we try to clean it up later.
         // It's safe to unregister session even if the call to register it has failed, because its ID is unique.
@@ -258,7 +242,7 @@ public class StreamingContext implements SubscriptionStreamer {
     }
 
     public void unregisterSession() {
-        log.info("Unregistering session {}", session);
+        LOG.info("Unregistering session {}", session);
         try {
             if (sessionListSubscription != null) {
                 sessionListSubscription.close();
@@ -283,10 +267,6 @@ public class StreamingContext implements SubscriptionStreamer {
 
     public void scheduleTask(final Runnable task, final long timeout, final TimeUnit unit) {
         timer.schedule(() -> this.addTask(task), timeout, unit);
-    }
-
-    public boolean isConnectionReady() {
-        return connectionReady.get();
     }
 
     public boolean isSubscriptionConsumptionBlocked() {
@@ -317,7 +297,7 @@ public class StreamingContext implements SubscriptionStreamer {
                             zkClient.listSessions(),
                             topology.getPartitions());
                 } catch (final RebalanceConflictException e) {
-                    log.warn("failed to rebalance partitions: {}", e.getMessage(), e);
+                    LOG.warn("failed to rebalance partitions: {}", e.getMessage(), e);
                     return new Partition[0];
                 }
             });
@@ -329,7 +309,7 @@ public class StreamingContext implements SubscriptionStreamer {
             try {
                 authorizationCheckSubscription.close();
             } catch (final IOException e) {
-                log.error("Failed to cancel subscription for authorization updates. " +
+                LOG.error("Failed to cancel subscription for authorization updates. " +
                         "This operation should not throw exceptions at all", e);
             } finally {
                 authorizationCheckSubscription = null;
@@ -367,7 +347,6 @@ public class StreamingContext implements SubscriptionStreamer {
         private ZkSubscriptionClient zkClient;
         private BiFunction<Collection<Session>, Partition[], Partition[]> rebalancer;
         private long kafkaPollTimeout;
-        private AtomicBoolean connectionReady;
         private CursorTokenService cursorTokenService;
         private ObjectMapper objectMapper;
         private EventStreamChecks eventStreamChecks;
@@ -379,11 +358,9 @@ public class StreamingContext implements SubscriptionStreamer {
         private AuthorizationValidator authorizationValidator;
         private EventTypeChangeListener eventTypeChangeListener;
         private Comparator<NakadiCursor> cursorComparator;
-        private NakadiKpiPublisher kpiPublisher;
         private CursorOperationsService cursorOperationsService;
-        private String kpiDataStremedEventType;
-        private long kpiCollectionFrequencyMs;
         private long streamMemoryLimitBytes;
+        private ConsumptionKpiCollector kpiCollector;
 
         public Builder setOut(final SubscriptionOutput out) {
             this.out = out;
@@ -427,11 +404,6 @@ public class StreamingContext implements SubscriptionStreamer {
 
         public Builder setKafkaPollTimeout(final long kafkaPollTimeout) {
             this.kafkaPollTimeout = kafkaPollTimeout;
-            return this;
-        }
-
-        public Builder setConnectionReady(final AtomicBoolean connectionReady) {
-            this.connectionReady = connectionReady;
             return this;
         }
 
@@ -485,23 +457,13 @@ public class StreamingContext implements SubscriptionStreamer {
             return this;
         }
 
-        public Builder setKpiPublisher(final NakadiKpiPublisher kpiPublisher) {
-            this.kpiPublisher = kpiPublisher;
-            return this;
-        }
-
         public Builder setCursorOperationsService(final CursorOperationsService cursorOperationsService) {
             this.cursorOperationsService = cursorOperationsService;
             return this;
         }
 
-        public Builder setKpiDataStremedEventType(final String kpiDataStremedEventType) {
-            this.kpiDataStremedEventType = kpiDataStremedEventType;
-            return this;
-        }
-
-        public Builder setKpiCollectionFrequencyMs(final long kpiCollectionFrequencyMs) {
-            this.kpiCollectionFrequencyMs = kpiCollectionFrequencyMs;
+        public Builder setKpiCollector(final ConsumptionKpiCollector kpiCollector) {
+            this.kpiCollector = kpiCollector;
             return this;
         }
 

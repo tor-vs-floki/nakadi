@@ -17,21 +17,7 @@ import static io.opentracing.propagation.Format.Builtin.HTTP_HEADERS;
 import static io.opentracing.propagation.Format.Builtin.TEXT_MAP;
 
 public class TracingService {
-    private static final String BUCKET_NAME_5_KB = "<5K";
-    private static final String BUCKET_NAME_5_50_KB = "5K-50K";
-    private static final String BUCKET_NAME_MORE_THAN_50_KB = ">50K";
-
-    private static final long BUCKET_5_KB = 5000L;
-    private static final long BUCKET_50_KB = 50000L;
-
-    public static String getSLOBucketName(final long batchSize) {
-        if (batchSize > BUCKET_50_KB) {
-            return BUCKET_NAME_MORE_THAN_50_KB;
-        } else if (batchSize < BUCKET_5_KB) {
-            return BUCKET_NAME_5_KB;
-        }
-        return BUCKET_NAME_5_50_KB;
-    }
+    public static final String ERROR_DESCRIPTION = "error.description";
 
     public static Tracer.SpanBuilder buildNewSpan(final String operationName) {
         return GlobalTracer.get().buildSpan(operationName);
@@ -94,7 +80,7 @@ public class TracingService {
 
     public static void logError(final String error) {
         if (error != null) {
-            getActiveSpan().log(ImmutableMap.of("error.description", error));
+            getActiveSpan().log(ImmutableMap.of(ERROR_DESCRIPTION, error));
         }
     }
 
@@ -103,11 +89,7 @@ public class TracingService {
     }
 
     public static void logError(final Span span, final Exception ex) {
-        if (ex.getMessage() != null) {
-            span.log(ImmutableMap.of("error.description", ex.getMessage()));
-        } else {
-            span.log(ImmutableMap.of("error.description", ex.toString()));
-        }
+        span.log(ImmutableMap.of(ERROR_DESCRIPTION, ex.getMessage() != null ? ex.getMessage() : ex.toString()));
     }
 
     public static void log(final Map<String, ?> fields) {

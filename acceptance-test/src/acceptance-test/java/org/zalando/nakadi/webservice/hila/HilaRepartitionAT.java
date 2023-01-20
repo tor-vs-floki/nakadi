@@ -28,8 +28,6 @@ import java.util.stream.Collectors;
 public class HilaRepartitionAT extends BaseAT {
     private static final Logger LOG = LoggerFactory.getLogger(HilaRepartitionAT.class);
     private static final CuratorFramework CURATOR = ZookeeperTestUtils.createCurator(ZOOKEEPER_URL);
-    private ZooKeeperHolder zooKeeperHolder;
-    private final String sid = TestUtils.randomUUID();
     private final String subscriptionId = TestUtils.randomUUID();
     private final String eventTypeName = "random";
     private final String secondEventTypeName = "random_et_2";
@@ -39,7 +37,6 @@ public class HilaRepartitionAT extends BaseAT {
         final ZkSubscriptionClient subscriptionClient = new NewZkSubscriptionClient(
                 subscriptionId,
                 new ZooKeeperHolder.DisposableCuratorFramework(CURATOR),
-                String.format("%s.%s", subscriptionId, sid),
                 MAPPER
         );
 
@@ -62,7 +59,6 @@ public class HilaRepartitionAT extends BaseAT {
         final ZkSubscriptionClient subscriptionClient = new NewZkSubscriptionClient(
                 subscriptionId,
                 new ZooKeeperHolder.DisposableCuratorFramework(CURATOR),
-                String.format("%s.%s", subscriptionId, sid),
                 MAPPER
         );
 
@@ -116,11 +112,13 @@ public class HilaRepartitionAT extends BaseAT {
                 .create(URL, subscription.getId(), "")
                 .startWithAutocommit(streamBatches -> LOG.info("{}", streamBatches));
 
-        TestUtils.waitFor(() -> MatcherAssert.assertThat(client.getBatches(), Matchers.hasSize(1)));
-        Assert.assertEquals("0", client.getBatches().get(0).getCursor().getPartition());
+        TestUtils.waitFor(() -> MatcherAssert.assertThat(client.getJsonBatches(), Matchers.hasSize(1)));
+        Assert.assertEquals("0", client.getJsonBatches().get(0).getCursor().getPartition());
 
         NakadiTestUtils.repartitionEventType(eventType, 2);
         TestUtils.waitFor(() -> MatcherAssert.assertThat(client.isRunning(), Matchers.is(false)));
+
+        Thread.sleep(1500);
 
         final TestStreamingClient clientAfterRepartitioning = TestStreamingClient
                 .create(URL, subscription.getId(), "")
@@ -129,8 +127,9 @@ public class HilaRepartitionAT extends BaseAT {
         NakadiTestUtils.publishBusinessEventWithUserDefinedPartition(
                 eventType.getName(), 1, x -> "{\"foo\":\"bar" + x + "\"}", p -> "1");
 
-        TestUtils.waitFor(() -> MatcherAssert.assertThat(clientAfterRepartitioning.getBatches(), Matchers.hasSize(1)));
-        Assert.assertEquals("1", clientAfterRepartitioning.getBatches().get(0).getCursor().getPartition());
+        TestUtils.waitFor(() -> MatcherAssert.assertThat(
+                clientAfterRepartitioning.getJsonBatches(), Matchers.hasSize(1)));
+        Assert.assertEquals("1", clientAfterRepartitioning.getJsonBatches().get(0).getCursor().getPartition());
     }
 
     @Test(timeout = 30000)
@@ -150,14 +149,15 @@ public class HilaRepartitionAT extends BaseAT {
                 .create(URL, subscription.getId(), "")
                 .startWithAutocommit(streamBatches -> LOG.info("{}", streamBatches));
 
-        TestUtils.waitFor(() -> MatcherAssert.assertThat(client.getBatches(), Matchers.hasSize(1)));
-        Assert.assertEquals("0", client.getBatches().get(0).getCursor().getPartition());
+        TestUtils.waitFor(() -> MatcherAssert.assertThat(client.getJsonBatches(), Matchers.hasSize(1)));
+        Assert.assertEquals("0", client.getJsonBatches().get(0).getCursor().getPartition());
 
         NakadiTestUtils.createTimeline(eventType.getName());
 
         NakadiTestUtils.repartitionEventType(eventType, 2);
-
         TestUtils.waitFor(() -> MatcherAssert.assertThat(client.isRunning(), Matchers.is(false)));
+
+        Thread.sleep(1500);
 
         final TestStreamingClient clientAfterRepartitioning = TestStreamingClient
                 .create(URL, subscription.getId(), "")
@@ -166,7 +166,8 @@ public class HilaRepartitionAT extends BaseAT {
         NakadiTestUtils.publishBusinessEventWithUserDefinedPartition(
                 eventType.getName(), 1, x -> "{\"foo\":\"bar" + x + "\"}", p -> "1");
 
-        TestUtils.waitFor(() -> MatcherAssert.assertThat(clientAfterRepartitioning.getBatches(), Matchers.hasSize(1)));
-        Assert.assertEquals("1", clientAfterRepartitioning.getBatches().get(0).getCursor().getPartition());
+        TestUtils.waitFor(() -> MatcherAssert.assertThat(
+                clientAfterRepartitioning.getJsonBatches(), Matchers.hasSize(1)));
+        Assert.assertEquals("1", clientAfterRepartitioning.getJsonBatches().get(0).getCursor().getPartition());
     }
 }

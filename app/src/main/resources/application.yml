@@ -25,13 +25,6 @@ spring:
       min-evictable-idle-time-millis: 60000
       connection-properties: socketTimeout=2;connectTimeout=2;loginTimeout=2
 
-hystrix.command.default.execution.isolation.strategy: SEMAPHORE
-hystrix.command.default.execution.isolation.thread.timeoutInMilliseconds: 15000
-hystrix.command.default.circuitBreaker.requestVolumeThreshold: 20
-hystrix.command.default.circuitBreaker.sleepWindowInMilliseconds: 5000
-hystrix.command.default.circuitBreaker.errorThresholdPercentage: 20
-hystrix.command.default.metrics.rollingStats.timeInMilliseconds: 30000
-
 nakadi:
   admin.default:
     dataType: service
@@ -62,6 +55,7 @@ nakadi:
     maxConnections: 5
     maxStreamMemoryBytes: 50000000 # ~50 MB
   kafka:
+    retries: 0
     request.timeout.ms: 30000
     instanceType: t2.large
     poll.timeoutMs: 100
@@ -73,9 +67,11 @@ nakadi:
     # Y - spike koeff, to get traffic for loaded instance out of average traffic (here: 2)
     # Z - seconds to tolerate networking issues (here: 10)
     linger.ms: 0
+    max.in.flight.requests.per.connection: 5
     enable.auto.commit: false
     delivery.timeout.ms: 30000 # request.timeout.ms + linger.ms
     max.block.ms: 5000 # kafka default 60000
+    metadata.max.age.ms: 300000 # 5 min, default
   zookeeper:
     connectionString: zookeeper://zookeeper:2181
     sessionTimeoutMs: 10000
@@ -84,7 +80,6 @@ nakadi:
 
   oauth2:
     mode: BASIC
-    adminClientId: adminClientId
     tokenInfoUrl: https://example.com/tokeninfo
     localTokenInfoUrl: "http://localhost:9021/oauth2/tokeninfo"
     clientId: stups_aruha-event-store-poc
@@ -110,12 +105,6 @@ nakadi:
     timelineCleanup:
       runPeriodMs: 3600000 # 1 hour
       deletionDelayMs: 2000 # 2 seconds, to be on the safe side
-    disk-usage-stats:
-      runPeriodMs: 3600000 # 1 hour
-      authDataType: "*"
-      authValue: "*"
-      owningApplication: "stups_nakadi"
-      eventTypeName: "nakadi.disk.usage"
     consumerNodesCleanup.runPeriodMs: 21600000 # 6 hours
   http.pool.connection:
     max.total: 20
@@ -151,18 +140,23 @@ nakadi:
 twintip:
   mapping: /api
   yaml: "file:api/nakadi-event-bus-api.yaml"
----
 
+---
 spring:
-  profiles: acceptanceTest
+  config:
+    activate:
+      on-profile: acceptanceTest
+
 nakadi:
+  eventType.deletableSubscription:
+    owningApplication: "deletable_owning_app"
+    consumerGroup: "deletable_consumer_group"
   stream:
     maxStreamMemoryBytes: 10_000 # ~10 Kb
     max.commitTimeout: 5 # seconds
   subscription:
     maxPartitions: 30
   features.defaultFeatures:
-    CONNECTION_CLOSE_CRUTCH: true
     DISABLE_EVENT_TYPE_CREATION: false
     DISABLE_EVENT_TYPE_DELETION: false
     DISABLE_SUBSCRIPTION_CREATION: false
@@ -172,21 +166,25 @@ nakadi:
     AUDIT_LOG_COLLECTION: true
     EVENT_OWNER_SELECTOR_AUTHZ: false
     ACCESS_LOG_ENABLED: true
+  kafka:
+    metadata.max.age.ms: 1000
 kpi:
   config:
     stream-data-collection-frequency-ms: 100
 
 ---
-
 spring:
-  profiles: test
+  config:
+    activate:
+      on-profile: test
 
 ---
-
 spring:
-  profiles: local
+  config:
+    activate:
+      on-profile: local
+
 nakadi.features.defaultFeatures:
-  CONNECTION_CLOSE_CRUTCH: false
   DISABLE_EVENT_TYPE_CREATION: false
   DISABLE_EVENT_TYPE_DELETION: false
   DISABLE_SUBSCRIPTION_CREATION: false

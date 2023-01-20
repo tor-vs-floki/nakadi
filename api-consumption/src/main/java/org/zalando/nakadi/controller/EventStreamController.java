@@ -39,7 +39,6 @@ import org.zalando.nakadi.repository.EventConsumer;
 import org.zalando.nakadi.repository.TopicRepository;
 import org.zalando.nakadi.security.Client;
 import org.zalando.nakadi.service.AuthorizationValidator;
-import org.zalando.nakadi.service.ClosedConnectionsCrutch;
 import org.zalando.nakadi.service.CursorConverter;
 import org.zalando.nakadi.service.EventStream;
 import org.zalando.nakadi.service.EventStreamChecks;
@@ -47,13 +46,12 @@ import org.zalando.nakadi.service.EventStreamConfig;
 import org.zalando.nakadi.service.EventStreamFactory;
 import org.zalando.nakadi.service.EventTypeChangeListener;
 import org.zalando.nakadi.service.timeline.TimelineService;
-import org.zalando.nakadi.util.FlowIdUtils;
+import org.zalando.nakadi.util.MDCUtils;
 import org.zalando.nakadi.view.Cursor;
 import org.zalando.problem.Problem;
 import org.zalando.problem.StatusType;
 
 import javax.annotation.Nullable;
-import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 import java.io.Closeable;
 import java.io.IOException;
@@ -86,7 +84,6 @@ public class EventStreamController {
     private final ObjectMapper jsonMapper;
     private final EventStreamFactory eventStreamFactory;
     private final MetricRegistry metricRegistry;
-    private final ClosedConnectionsCrutch closedConnectionsCrutch;
     private final EventStreamChecks eventStreamChecks;
     private final CursorConverter cursorConverter;
     private final MetricRegistry streamMetrics;
@@ -102,7 +99,6 @@ public class EventStreamController {
                                  final EventStreamFactory eventStreamFactory,
                                  final MetricRegistry metricRegistry,
                                  @Qualifier("streamMetricsRegistry") final MetricRegistry streamMetrics,
-                                 final ClosedConnectionsCrutch closedConnectionsCrutch,
                                  final EventStreamChecks eventStreamChecks,
                                  final CursorConverter cursorConverter,
                                  final AuthorizationValidator authorizationValidator,
@@ -113,7 +109,6 @@ public class EventStreamController {
         this.eventStreamFactory = eventStreamFactory;
         this.metricRegistry = metricRegistry;
         this.streamMetrics = streamMetrics;
-        this.closedConnectionsCrutch = closedConnectionsCrutch;
         this.eventStreamChecks = eventStreamChecks;
         this.cursorConverter = cursorConverter;
         this.authorizationValidator = authorizationValidator;
@@ -194,112 +189,110 @@ public class EventStreamController {
             @Nullable
             @RequestParam(value = "stream_keep_alive_limit", required = false) final Integer streamKeepAliveLimit,
             @Nullable @RequestHeader(name = "X-nakadi-cursors", required = false) final String cursorsStr,
-            final HttpServletRequest request, final HttpServletResponse response, final Client client) {
-        final String flowId = FlowIdUtils.peek();
+            final HttpServletResponse response, final Client client) {
+        final MDCUtils.Context requestContext = MDCUtils.getContext();
 
         return outputStream -> {
-            FlowIdUtils.push(flowId);
-
-            if (eventStreamChecks.isConsumptionBlocked(Collections.singleton(eventTypeName), client.getClientId())) {
-                writeProblemResponse(response, outputStream,
-                        Problem.valueOf(FORBIDDEN, "Application or event type is blocked"));
-                return;
-            }
-
-            final AtomicBoolean connectionReady = new AtomicBoolean(true);
-            // Setting always true to validate that ClosedConnectionsCrutch is not needed in Springboot 2 version.
-            //closedConnectionsCrutch.listenForConnectionClose(request);
-            Counter consumerCounter = null;
-            EventStream eventStream = null;
-            final AtomicBoolean needCheckAuthorization = new AtomicBoolean(false);
-
-            LOG.info("[X-NAKADI-CURSORS] \"{}\" {}", eventTypeName, Optional.ofNullable(cursorsStr).orElse("-"));
-
-            try (Closeable ignore = eventTypeChangeListener.registerListener(et -> needCheckAuthorization.set(true),
-                    Collections.singletonList(eventTypeName))) {
-                final EventType eventType = eventTypeCache.getEventType(eventTypeName);
-
-                authorizationValidator.authorizeEventTypeView(eventType);
-                authorizeStreamRead(eventTypeName);
-
-                // validate parameters
-                final EventStreamConfig streamConfig = EventStreamConfig.builder()
-                        .withBatchLimit(batchLimit)
-                        .withStreamLimit(streamLimit)
-                        .withBatchTimeout(batchTimeout)
-                        .withStreamTimeout(streamTimeout)
-                        .withStreamKeepAliveLimit(streamKeepAliveLimit)
-                        .withEtName(eventTypeName)
-                        .withConsumingClient(client)
-                        .withCursors(getStreamingStart(eventType, cursorsStr))
-                        .withMaxMemoryUsageBytes(maxMemoryUsageBytes)
-                        .build();
-
-                consumerCounter = metricRegistry.counter(metricNameFor(eventTypeName, CONSUMERS_COUNT_METRIC_NAME));
-                consumerCounter.inc();
-
-                final String kafkaQuotaClientId = getKafkaQuotaClientId(eventTypeName, client);
-
-                response.setStatus(HttpStatus.OK.value());
-                response.setHeader("Warning", "299 - nakadi - the Low-level API is deprecated and will " +
-                        "be removed from a future release. Please consider migrating to the Subscriptions API.");
-                response.setContentType("application/x-json-stream");
-                final EventConsumer eventConsumer = timelineService.createEventConsumer(
-                        kafkaQuotaClientId, streamConfig.getCursors());
-
-                final String bytesFlushedMetricName = MetricUtils.metricNameForLoLAStream(
-                        client.getClientId(),
-                        eventTypeName);
-
-                final Meter bytesFlushedMeter = this.streamMetrics.meter(bytesFlushedMetricName);
-
-                eventStream = eventStreamFactory.createEventStream(
-                        outputStream, eventConsumer, streamConfig, bytesFlushedMeter);
-
-                outputStream.flush(); // Flush status code to client
-
-                eventStream.streamEvents(connectionReady, () -> {
-                    if (needCheckAuthorization.getAndSet(false)) {
-                        authorizeStreamRead(eventTypeName);
-                    }
-                });
-            } catch (final UnparseableCursorException e) {
-                LOG.debug("Incorrect syntax of X-nakadi-cursors header: {}. Respond with BAD_REQUEST.",
-                        e.getCursors(), e);
-                writeProblemResponse(response, outputStream, BAD_REQUEST, e.getMessage());
-            } catch (final NoSuchEventTypeException e) {
-                writeProblemResponse(response, outputStream, NOT_FOUND, "topic not found");
-            } catch (final NoConnectionSlotsException e) {
-                LOG.debug("Connection creation failed due to exceeding max connection count");
-                writeProblemResponse(response, outputStream,
-                        Problem.valueOf(TOO_MANY_REQUESTS, e.getMessage()));
-            } catch (final ServiceTemporarilyUnavailableException e) {
-                LOG.error("Error while trying to stream events.", e);
-                writeProblemResponse(response, outputStream, SERVICE_UNAVAILABLE, e.getMessage());
-            } catch (final InvalidLimitException e) {
-                writeProblemResponse(response, outputStream, UNPROCESSABLE_ENTITY, e.getMessage());
-            } catch (final InternalNakadiException e) {
-                LOG.error("Error while trying to stream events.", e);
-                writeProblemResponse(response, outputStream, INTERNAL_SERVER_ERROR, e.getMessage());
-            } catch (final InvalidCursorException e) {
-                writeProblemResponse(response, outputStream, PRECONDITION_FAILED, e.getMessage());
-            } catch (final AccessDeniedException e) {
-                writeProblemResponse(response, outputStream, FORBIDDEN, e.explain());
-            } catch (final Exception e) {
-                LOG.error("Error while trying to stream events. Respond with INTERNAL_SERVER_ERROR.", e);
-                writeProblemResponse(response, outputStream, INTERNAL_SERVER_ERROR, e.getMessage());
-            } finally {
-                connectionReady.set(false);
-                if (consumerCounter != null) {
-                    consumerCounter.dec();
+            try (MDCUtils.CloseableNoEx ignore1 = MDCUtils.withContext(requestContext)) {
+                if (eventStreamChecks.isConsumptionBlocked(
+                        Collections.singleton(eventTypeName), client.getClientId())) {
+                    writeProblemResponse(response, outputStream,
+                            Problem.valueOf(FORBIDDEN, "Application or event type is blocked"));
+                    return;
                 }
-                if (eventStream != null) {
-                    eventStream.close();
-                }
-                try {
-                    outputStream.flush();
+
+                Counter consumerCounter = null;
+                EventStream eventStream = null;
+                final AtomicBoolean needCheckAuthorization = new AtomicBoolean(false);
+
+                LOG.info("[X-NAKADI-CURSORS] \"{}\" {}", eventTypeName, Optional.ofNullable(cursorsStr).orElse("-"));
+
+                try (Closeable ignore2 = eventTypeChangeListener.registerListener(
+                        et -> needCheckAuthorization.set(true),
+                        Collections.singletonList(eventTypeName))) {
+                    final EventType eventType = eventTypeCache.getEventType(eventTypeName);
+
+                    authorizationValidator.authorizeEventTypeView(eventType);
+                    authorizeStreamRead(eventTypeName);
+
+                    // validate parameters
+                    final EventStreamConfig streamConfig = EventStreamConfig.builder()
+                            .withBatchLimit(batchLimit)
+                            .withStreamLimit(streamLimit)
+                            .withBatchTimeout(batchTimeout)
+                            .withStreamTimeout(streamTimeout)
+                            .withStreamKeepAliveLimit(streamKeepAliveLimit)
+                            .withEtName(eventTypeName)
+                            .withConsumingClient(client)
+                            .withCursors(getStreamingStart(eventType, cursorsStr))
+                            .withMaxMemoryUsageBytes(maxMemoryUsageBytes)
+                            .build();
+
+                    consumerCounter = metricRegistry.counter(metricNameFor(eventTypeName, CONSUMERS_COUNT_METRIC_NAME));
+                    consumerCounter.inc();
+
+                    final String kafkaQuotaClientId = getKafkaQuotaClientId(eventTypeName, client);
+
+                    response.setStatus(HttpStatus.OK.value());
+                    response.setHeader("Warning", "299 - nakadi - the Low-level API is deprecated and will "
+                            + "be removed from a future release. Please consider migrating to the Subscriptions API.");
+                    response.setContentType("application/x-json-stream");
+                    final EventConsumer eventConsumer = timelineService.createEventConsumer(
+                            kafkaQuotaClientId, streamConfig.getCursors());
+
+                    final String bytesFlushedMetricName = MetricUtils.metricNameForLoLAStream(
+                            client.getClientId(),
+                            eventTypeName);
+
+                    final Meter bytesFlushedMeter = this.streamMetrics.meter(bytesFlushedMetricName);
+
+                    eventStream = eventStreamFactory.createEventStream(
+                            outputStream, eventConsumer, streamConfig, bytesFlushedMeter);
+
+                    outputStream.flush(); // Flush status code to client
+
+                    eventStream.streamEvents(() -> {
+                        if (needCheckAuthorization.getAndSet(false)) {
+                            authorizeStreamRead(eventTypeName);
+                        }
+                    });
+                } catch (final UnparseableCursorException e) {
+                    LOG.debug("Incorrect syntax of X-nakadi-cursors header: {}. Respond with BAD_REQUEST.",
+                            e.getCursors(), e);
+                    writeProblemResponse(response, outputStream, BAD_REQUEST, e.getMessage());
+                } catch (final NoSuchEventTypeException e) {
+                    writeProblemResponse(response, outputStream, NOT_FOUND, "topic not found");
+                } catch (final NoConnectionSlotsException e) {
+                    LOG.debug("Connection creation failed due to exceeding max connection count");
+                    writeProblemResponse(response, outputStream,
+                            Problem.valueOf(TOO_MANY_REQUESTS, e.getMessage()));
+                } catch (final ServiceTemporarilyUnavailableException e) {
+                    LOG.error("Error while trying to stream events.", e);
+                    writeProblemResponse(response, outputStream, SERVICE_UNAVAILABLE, e.getMessage());
+                } catch (final InvalidLimitException e) {
+                    writeProblemResponse(response, outputStream, UNPROCESSABLE_ENTITY, e.getMessage());
+                } catch (final InternalNakadiException e) {
+                    LOG.error("Error while trying to stream events.", e);
+                    writeProblemResponse(response, outputStream, INTERNAL_SERVER_ERROR, e.getMessage());
+                } catch (final InvalidCursorException e) {
+                    writeProblemResponse(response, outputStream, PRECONDITION_FAILED, e.getMessage());
+                } catch (final AccessDeniedException e) {
+                    writeProblemResponse(response, outputStream, FORBIDDEN, e.explain());
+                } catch (final Exception e) {
+                    LOG.error("Error while trying to stream events. Respond with INTERNAL_SERVER_ERROR.", e);
+                    writeProblemResponse(response, outputStream, INTERNAL_SERVER_ERROR, e.getMessage());
                 } finally {
-                    outputStream.close();
+                    if (consumerCounter != null) {
+                        consumerCounter.dec();
+                    }
+                    if (eventStream != null) {
+                        eventStream.close();
+                    }
+                    try {
+                        outputStream.flush();
+                    } finally {
+                        outputStream.close();
+                    }
                 }
             }
         };

@@ -11,14 +11,17 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 import org.zalando.nakadi.ShutdownHooks;
+import org.zalando.nakadi.cache.SubscriptionCache;
 import org.zalando.nakadi.config.NakadiSettings;
 import org.zalando.nakadi.domain.Subscription;
 import org.zalando.nakadi.exceptions.runtime.AccessDeniedException;
@@ -29,17 +32,17 @@ import org.zalando.nakadi.exceptions.runtime.InvalidStreamParametersException;
 import org.zalando.nakadi.exceptions.runtime.NoStreamingSlotsAvailable;
 import org.zalando.nakadi.exceptions.runtime.NoSuchSubscriptionException;
 import org.zalando.nakadi.exceptions.runtime.SubscriptionPartitionConflictException;
-import org.zalando.nakadi.repository.db.SubscriptionDbRepository;
 import org.zalando.nakadi.security.Client;
 import org.zalando.nakadi.service.EventStreamChecks;
 import org.zalando.nakadi.service.SubscriptionValidationService;
 import org.zalando.nakadi.service.TracingService;
+import org.zalando.nakadi.service.subscription.StreamContentType;
 import org.zalando.nakadi.service.subscription.StreamParameters;
 import org.zalando.nakadi.service.subscription.SubscriptionOutput;
 import org.zalando.nakadi.service.subscription.SubscriptionStreamer;
 import org.zalando.nakadi.service.subscription.SubscriptionStreamerFactory;
 import org.zalando.nakadi.service.subscription.model.Session;
-import org.zalando.nakadi.util.FlowIdUtils;
+import org.zalando.nakadi.util.MDCUtils;
 import org.zalando.nakadi.view.UserStreamParameters;
 import org.zalando.problem.Problem;
 
@@ -50,8 +53,8 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 
 import static org.zalando.nakadi.metrics.MetricUtils.metricNameForSubscription;
@@ -67,13 +70,14 @@ import static org.zalando.problem.Status.UNPROCESSABLE_ENTITY;
 public class SubscriptionStreamController {
     public static final String CONSUMERS_COUNT_METRIC_NAME = "consumers";
     private static final Logger LOG = LoggerFactory.getLogger(SubscriptionStreamController.class);
+    public static final MediaType BINARY_MEDIA_TYPE = new MediaType("application", "avro-binary");
 
     private final SubscriptionStreamerFactory subscriptionStreamerFactory;
     private final ObjectMapper jsonMapper;
     private final NakadiSettings nakadiSettings;
     private final EventStreamChecks eventStreamChecks;
     private final MetricRegistry metricRegistry;
-    private final SubscriptionDbRepository subscriptionDbRepository;
+    private final SubscriptionCache subscriptionCache;
     private final SubscriptionValidationService subscriptionValidationService;
     private final ShutdownHooks shutdownHooks;
 
@@ -83,7 +87,7 @@ public class SubscriptionStreamController {
                                         final NakadiSettings nakadiSettings,
                                         final EventStreamChecks eventStreamChecks,
                                         @Qualifier("perPathMetricRegistry") final MetricRegistry metricRegistry,
-                                        final SubscriptionDbRepository subscriptionDbRepository,
+                                        final SubscriptionCache subscriptionCache,
                                         final SubscriptionValidationService subscriptionValidationService,
                                         final ShutdownHooks shutdownHooks) {
         this.subscriptionStreamerFactory = subscriptionStreamerFactory;
@@ -91,7 +95,7 @@ public class SubscriptionStreamController {
         this.nakadiSettings = nakadiSettings;
         this.eventStreamChecks = eventStreamChecks;
         this.metricRegistry = metricRegistry;
-        this.subscriptionDbRepository = subscriptionDbRepository;
+        this.subscriptionCache = subscriptionCache;
         this.subscriptionValidationService = subscriptionValidationService;
         this.shutdownHooks = shutdownHooks;
     }
@@ -142,7 +146,17 @@ public class SubscriptionStreamController {
 
         @Override
         public void onException(final Exception ex) {
-            LOG.warn("Exception occurred while streaming: {}", ex.getMessage());
+            //
+            // Here we are trying to avoid spamming the logs with stacktraces for very common errors like "no free
+            // slots" or "access denied".
+            //
+            // FIXME: maybe these should not be exceptions in the first place?..
+            //
+            if (ex instanceof InternalNakadiException) {
+                LOG.error("Internal error occurred while streaming", ex);
+            } else {
+                LOG.info("Exception occurred while streaming: {}: {}", ex.getClass().getName(), ex.getMessage());
+            }
             if (!headersSent) {
                 headersSent = true;
                 try {
@@ -153,7 +167,7 @@ public class SubscriptionStreamController {
                     LOG.error("Failed to write exception to response", e);
                 }
             } else {
-                LOG.warn("Exception found while streaming, but no data could be provided to client", ex);
+                LOG.warn("Response was already sent, cannot report error to the client");
             }
         }
 
@@ -168,12 +182,14 @@ public class SubscriptionStreamController {
     public StreamingResponseBody streamEvents(
             @PathVariable("subscription_id") final String subscriptionId,
             @Valid @RequestBody final UserStreamParameters userParameters,
+            @RequestHeader(name = "Accept", required = false,
+                    defaultValue = "application/x-json-stream") final String acceptHeader,
             final HttpServletResponse response,
             final Client client) {
 
         final StreamParameters streamParameters = StreamParameters.of(userParameters,
                 nakadiSettings.getMaxCommitTimeout(), client);
-        return stream(subscriptionId, response, client, streamParameters);
+        return stream(subscriptionId, response, client, streamParameters, mapToStreamContentType(acceptHeader));
     }
 
     @RequestMapping(value = "/subscriptions/{subscription_id}/events", method = RequestMethod.GET)
@@ -189,6 +205,8 @@ public class SubscriptionStreamController {
             @Nullable @RequestParam(value = "stream_keep_alive_limit", required = false) final Integer
                     streamKeepAliveLimit,
             @Nullable @RequestParam(value = "commit_timeout", required = false) final Long commitTimeout,
+            @RequestHeader(name = "Accept", required = false,
+                    defaultValue = "application/x-json-stream") final String acceptHeader,
             final HttpServletResponse response, final Client client) {
 
         final UserStreamParameters userParameters = new UserStreamParameters(batchLimit, streamLimit, batchTimespan,
@@ -198,67 +216,78 @@ public class SubscriptionStreamController {
         final StreamParameters streamParameters = StreamParameters.of(userParameters,
                 nakadiSettings.getMaxCommitTimeout(), client);
 
-        return stream(subscriptionId, response, client, streamParameters);
+        return stream(subscriptionId, response, client, streamParameters, mapToStreamContentType(acceptHeader));
+    }
+
+    private StreamContentType mapToStreamContentType(final String acceptHeader) {
+        final List<MediaType> mediaTypes = MediaType.parseMediaTypes(acceptHeader);
+        if (mediaTypes.size() == 1 &&
+                BINARY_MEDIA_TYPE.equalsTypeAndSubtype(mediaTypes.get(0))) {
+            return StreamContentType.BINARY;
+        } else {
+            return StreamContentType.JSON;
+        }
     }
 
     private StreamingResponseBody stream(final String subscriptionId,
                                          final HttpServletResponse response,
                                          final Client client,
-                                         final StreamParameters streamParameters) {
+                                         final StreamParameters streamParameters,
+                                         final StreamContentType streamContentType) {
+        final Session session = Session.generate(1, streamParameters.getPartitions());
+        try (MDCUtils.CloseableNoEx ignore1 = MDCUtils.withSubscriptionIdStreamId(subscriptionId, session.getId())) {
+            TracingService.setOperationName("stream_events")
+                    .setTag("subscription.id", subscriptionId);
 
-        TracingService.setOperationName("stream_events")
-                .setTag("subscription.id", subscriptionId);
+            final Span requestSpan = TracingService.getActiveSpan();
+            final MDCUtils.Context loggingContext = MDCUtils.getContext();
 
-        final Span requestSpan = TracingService.getActiveSpan();
-        final String flowId = FlowIdUtils.peek();
+            return outputStream -> {
+                try (MDCUtils.CloseableNoEx ignore2 = MDCUtils.withContext(loggingContext)) {
+                    final String metricName = metricNameForSubscription(subscriptionId, CONSUMERS_COUNT_METRIC_NAME);
+                    final Counter consumerCounter = metricRegistry.counter(metricName);
+                    consumerCounter.inc();
 
-        return outputStream -> {
-            FlowIdUtils.push(flowId);
-            final String metricName = metricNameForSubscription(subscriptionId, CONSUMERS_COUNT_METRIC_NAME);
-            final Counter consumerCounter = metricRegistry.counter(metricName);
-            consumerCounter.inc();
-            // Setting always true to validate that ClosedConnectionsCrutch is not needed in Springboot 2 version.
-            final AtomicBoolean connectionReady = new AtomicBoolean(true);
-            // closedConnectionsCrutch.listenForConnectionClose(request);
-            SubscriptionStreamer streamer = null;
-            final SubscriptionOutputImpl output = new SubscriptionOutputImpl(response, outputStream);
+                    SubscriptionStreamer streamer = null;
+                    final SubscriptionOutputImpl output = new SubscriptionOutputImpl(response, outputStream);
 
-            try {
-                if (eventStreamChecks.isSubscriptionConsumptionBlocked(subscriptionId, client.getClientId())) {
-                    writeProblemResponse(response, outputStream,
-                            Problem.valueOf(FORBIDDEN, "Application or event type is blocked"));
-                    return;
+                    try {
+                        if (eventStreamChecks.isSubscriptionConsumptionBlocked(subscriptionId, client.getClientId())) {
+                            writeProblemResponse(response, outputStream,
+                                    Problem.valueOf(FORBIDDEN, "Application or event type is blocked"));
+                            return;
+                        }
+                        final Subscription subscription = subscriptionCache.getSubscription(subscriptionId);
+                        subscriptionValidationService.validatePartitionsToStream(subscription,
+                                streamParameters.getPartitions());
+
+                        streamer = subscriptionStreamerFactory.build(subscription, streamParameters,
+                                session, output, streamContentType);
+
+                        final Tracer.SpanBuilder spanBuilder =
+                                TracingService.buildNewFollowerSpan(
+                                        "streaming_async", requestSpan.context())
+                                        .withTag("client", client.getClientId())
+                                        .withTag("session.id", session.getId())
+                                        .withTag("subscription.id", subscriptionId);
+                        try (
+                                Closeable ignore3 = TracingService.withActiveSpan(spanBuilder);
+                                Closeable ignore4 = shutdownHooks.addHook(streamer::terminateStream)
+                        ) {
+                            streamer.stream();
+                        }
+                    } catch (final InterruptedException ex) {
+                        LOG.warn("Interrupted while streaming with " + streamer, ex);
+                        Thread.currentThread().interrupt();
+                    } catch (final RuntimeException e) {
+                        output.onException(e);
+                    } finally {
+                        consumerCounter.dec();
+                        outputStream.close();
+                    }
                 }
-                final Subscription subscription = subscriptionDbRepository.getSubscription(subscriptionId);
-                subscriptionValidationService.validatePartitionsToStream(subscription,
-                        streamParameters.getPartitions());
-
-                final Session session = Session.generate(1, streamParameters.getPartitions());
-
-                streamer = subscriptionStreamerFactory.build(subscription, streamParameters, session, output,
-                        connectionReady);
-
-                final Tracer.SpanBuilder spanBuilder =
-                        TracingService.buildNewFollowerSpan("streaming_async", requestSpan.context())
-                        .withTag("client", client.getClientId())
-                        .withTag("session.id", session.getId())
-                        .withTag("subscription.id", subscriptionId);
-                try (
-                    Closeable ignore1 = TracingService.withActiveSpan(spanBuilder);
-                    Closeable ignore2 = shutdownHooks.addHook(streamer::terminateStream) // bugfix ARUHA-485
-                ) {
-                    streamer.stream();
-                }
-            } catch (final InterruptedException ex) {
-                LOG.warn("Interrupted while streaming with " + streamer, ex);
-                Thread.currentThread().interrupt();
-            } catch (final RuntimeException e) {
-                output.onException(e);
-            } finally {
-                consumerCounter.dec();
-                outputStream.close();
-            }
-        };
+            };
+        }
     }
 
     private void writeProblemResponse(final HttpServletResponse response,

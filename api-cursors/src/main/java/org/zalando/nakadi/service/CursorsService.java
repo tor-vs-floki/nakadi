@@ -23,7 +23,6 @@ import org.zalando.nakadi.exceptions.runtime.ZookeeperException;
 import org.zalando.nakadi.repository.TopicRepository;
 import org.zalando.nakadi.repository.db.SubscriptionDbRepository;
 import org.zalando.nakadi.service.publishing.NakadiAuditLogPublisher;
-import org.zalando.nakadi.service.subscription.LogPathBuilder;
 import org.zalando.nakadi.service.subscription.model.Partition;
 import org.zalando.nakadi.service.subscription.zk.SubscriptionClientFactory;
 import org.zalando.nakadi.service.subscription.zk.SubscriptionNotInitializedException;
@@ -87,8 +86,7 @@ public class CursorsService {
             authorizationValidator.authorizeSubscriptionView(subscription);
             authorizationValidator.authorizeSubscriptionCommit(subscription);
             validateSubscriptionCommitCursors(subscription, cursors);
-            try (ZkSubscriptionClient zkClient = zkSubscriptionFactory.createClient(
-                    subscription, LogPathBuilder.build(subscriptionId, streamId, "offsets"))) {
+            try (ZkSubscriptionClient zkClient = zkSubscriptionFactory.createClient(subscription)) {
                 validateStreamId(cursors, streamId, zkClient, subscriptionId);
                 return zkClient.commitOffsets(
                         cursors.stream().map(cursorConverter::convertToNoToken).collect(Collectors.toList()));
@@ -143,13 +141,23 @@ public class CursorsService {
         }
     }
 
+    public List<SubscriptionCursorWithoutToken> getSubscriptionCursorsForUpdate(final String subscriptionId)
+            throws InternalNakadiException, NoSuchEventTypeException,
+            NoSuchSubscriptionException, ServiceTemporarilyUnavailableException {
+        return getSubscriptionCursors(subscriptionRepository.getSubscription(subscriptionId));
+    }
+
     public List<SubscriptionCursorWithoutToken> getSubscriptionCursors(final String subscriptionId)
             throws InternalNakadiException, NoSuchEventTypeException,
             NoSuchSubscriptionException, ServiceTemporarilyUnavailableException {
-        final Subscription subscription = subscriptionRepository.getSubscription(subscriptionId);
+        return getSubscriptionCursors(subscriptionCache.getSubscription(subscriptionId));
+    }
+
+    private List<SubscriptionCursorWithoutToken> getSubscriptionCursors(final Subscription subscription)
+            throws InternalNakadiException, NoSuchEventTypeException,
+            NoSuchSubscriptionException, ServiceTemporarilyUnavailableException {
         authorizationValidator.authorizeSubscriptionView(subscription);
-        final ZkSubscriptionClient zkSubscriptionClient = zkSubscriptionFactory.createClient(
-                subscription, LogPathBuilder.build(subscriptionId, "get_cursors"));
+        final ZkSubscriptionClient zkSubscriptionClient = zkSubscriptionFactory.createClient(subscription);
         try {
             final ImmutableList.Builder<SubscriptionCursorWithoutToken> cursorsListBuilder = ImmutableList.builder();
 
@@ -197,15 +205,14 @@ public class CursorsService {
             entry.getKey().validateReadCursors(entry.getValue());
         }
 
-        final ZkSubscriptionClient zkClient = zkSubscriptionFactory.createClient(
-                subscription, LogPathBuilder.build(subscriptionId, "reset_cursors"));
+        final ZkSubscriptionClient zkClient = zkSubscriptionFactory.createClient(subscription);
         try {
             // In case if subscription was never initialized - initialize it
             SubscriptionInitializer.initialize(
                     zkClient, subscription, timelineService, cursorConverter);
             // add 1 second to commit timeout in order to give time to finish reset if there is uncommitted events
             if (!cursors.isEmpty()) {
-                final List<SubscriptionCursorWithoutToken> oldCursors = getSubscriptionCursors(subscriptionId);
+                final List<SubscriptionCursorWithoutToken> oldCursors = getSubscriptionCursorsForUpdate(subscriptionId);
 
                 final long timeout = TimeUnit.SECONDS.toMillis(nakadiSettings.getMaxCommitTimeout()) +
                         TimeUnit.SECONDS.toMillis(1);

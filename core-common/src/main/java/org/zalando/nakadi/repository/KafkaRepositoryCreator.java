@@ -11,6 +11,7 @@ import org.zalando.nakadi.domain.storage.KafkaConfiguration;
 import org.zalando.nakadi.domain.storage.Storage;
 import org.zalando.nakadi.exceptions.runtime.NakadiRuntimeException;
 import org.zalando.nakadi.exceptions.runtime.TopicRepositoryException;
+import org.zalando.nakadi.mapper.NakadiRecordMapper;
 import org.zalando.nakadi.repository.kafka.KafkaFactory;
 import org.zalando.nakadi.repository.kafka.KafkaLocationManager;
 import org.zalando.nakadi.repository.kafka.KafkaSettings;
@@ -33,6 +34,7 @@ public class KafkaRepositoryCreator implements TopicRepositoryCreator {
     private final KafkaTopicConfigFactory kafkaTopicConfigFactory;
     private final MetricRegistry metricRegistry;
     private final ObjectMapper objectMapper;
+    private final NakadiRecordMapper nakadiRecordMapper;
 
     @Autowired
     public KafkaRepositoryCreator(
@@ -41,13 +43,15 @@ public class KafkaRepositoryCreator implements TopicRepositoryCreator {
             final ZookeeperSettings zookeeperSettings,
             final KafkaTopicConfigFactory kafkaTopicConfigFactory,
             final MetricRegistry metricRegistry,
-            final ObjectMapper objectMapper) {
+            final ObjectMapper objectMapper,
+            final NakadiRecordMapper nakadiRecordMapper) {
         this.nakadiSettings = nakadiSettings;
         this.kafkaSettings = kafkaSettings;
         this.zookeeperSettings = zookeeperSettings;
         this.kafkaTopicConfigFactory = kafkaTopicConfigFactory;
         this.metricRegistry = metricRegistry;
         this.objectMapper = objectMapper;
+        this.nakadiRecordMapper = nakadiRecordMapper;
     }
 
     @Override
@@ -60,8 +64,7 @@ public class KafkaRepositoryCreator implements TopicRepositoryCreator {
                     zookeeperSettings.getZkConnectionTimeoutMs(),
                     nakadiSettings);
             final KafkaLocationManager kafkaLocationManager = new KafkaLocationManager(zooKeeperHolder, kafkaSettings);
-            final KafkaFactory kafkaFactory =
-                    new KafkaFactory(new KafkaLocationManager(zooKeeperHolder, kafkaSettings), metricRegistry);
+            final KafkaFactory kafkaFactory = new KafkaFactory(kafkaLocationManager);
             final KafkaZookeeper zk = new KafkaZookeeper(zooKeeperHolder, objectMapper);
             final KafkaTopicRepository kafkaTopicRepository =
                     new KafkaTopicRepository.Builder()
@@ -69,10 +72,9 @@ public class KafkaRepositoryCreator implements TopicRepositoryCreator {
                             .setKafkaFactory(kafkaFactory)
                             .setNakadiSettings(nakadiSettings)
                             .setKafkaSettings(kafkaSettings)
-                            .setZookeeperSettings(zookeeperSettings)
                             .setKafkaTopicConfigFactory(kafkaTopicConfigFactory)
                             .setKafkaLocationManager(kafkaLocationManager)
-                            .setMetricRegistry(metricRegistry)
+                            .setNakadiRecordMapper(nakadiRecordMapper)
                             .build();
             // check that it does work
             kafkaTopicRepository.listTopics();
